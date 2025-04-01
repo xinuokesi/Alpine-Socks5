@@ -19,6 +19,7 @@ CONFIG_FILE="/etc/3proxy/3proxy.cfg"
 SERVICE_NAME="3proxy"
 CONFIG_INFO="/etc/3proxy/proxy_info.txt"
 KEEPALIVE_SCRIPT="/etc/periodic/15min/3proxy_keepalive"
+PROXY_BIN=""  # 将由脚本自动检测
 
 # 检测是否通过管道执行
 is_pipe_execution() {
@@ -30,18 +31,92 @@ is_pipe_execution() {
     fi
 }
 
-# 安装必要的软件
+# 查找3proxy可执行文件的路径
+find_3proxy_path() {
+    echo "正在检测3proxy安装路径..."
+    # 尝试使用which查找
+    PROXY_BIN=$(which 3proxy 2>/dev/null)
+    
+    # 如果which找不到，尝试在常见位置搜索
+    if [ -z "$PROXY_BIN" ]; then
+        for path in "/usr/bin/3proxy" "/usr/sbin/3proxy" "/usr/local/bin/3proxy" "/usr/local/sbin/3proxy" "/bin/3proxy" "/sbin/3proxy"; do
+            if [ -x "$path" ]; then
+                PROXY_BIN="$path"
+                break
+            fi
+        done
+    fi
+    
+    # 如果仍然找不到，使用find命令
+    if [ -z "$PROXY_BIN" ]; then
+        echo "在常见位置未找到3proxy，正在全盘搜索..."
+        PROXY_BIN=$(find / -name "3proxy" -type f -executable 2>/dev/null | head -n 1)
+    fi
+    
+    # 验证找到的路径
+    if [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ]; then
+        echo "找到3proxy可执行文件: $PROXY_BIN"
+        return 0
+    else
+        echo "未找到可执行的3proxy，将尝试安装"
+        return 1
+    fi
+}
+
+# 安装必要的软件 - 确保在其他功能之前调用
 install_required_software() {
     echo "正在安装必要的软件..."
     apk update
-    apk add 3proxy openssl curl
+    
+    # 首先安装基本工具
+    apk add curl net-tools openssl
+    
+    # 安装3proxy并验证
+    echo "正在安装3proxy..."
+    apk add 3proxy
+    
+    if ! find_3proxy_path; then
+        echo "3proxy安装失败，尝试从其他软件源安装..."
+        # 尝试添加社区仓库
+        echo "http://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories
+        apk update
+        apk add 3proxy
+        
+        if ! find_3proxy_path; then
+            echo "尝试编译安装3proxy..."
+            # 尝试从源码编译
+            apk add gcc make musl-dev
+            mkdir -p /tmp/3proxy_build
+            cd /tmp/3proxy_build
+            curl -L -o 3proxy.tar.gz https://github.com/z3APA3A/3proxy/archive/0.9.4.tar.gz
+            tar xzf 3proxy.tar.gz
+            cd 3proxy-*
+            make -f Makefile.Linux
+            make -f Makefile.Linux install
+            cd /
+            rm -rf /tmp/3proxy_build
+            
+            # 再次检查安装
+            find_3proxy_path
+        fi
+    fi
+    
+    # 如果还是找不到3proxy，退出
+    if [ -z "$PROXY_BIN" ]; then
+        echo "错误: 无法安装3proxy，请手动安装后再运行此脚本"
+        exit 1
+    fi
     
     # 创建配置目录
     mkdir -p /etc/3proxy
     mkdir -p /etc/periodic/15min
     
     # 确保3proxy服务设置
-    rc-update add 3proxy default 2>/dev/null
+    if [ -f /etc/init.d/3proxy ]; then
+        rc-update add 3proxy default 2>/dev/null
+    else
+        echo "将创建3proxy服务脚本"
+    fi
 }
 
 # 设置保活功能
@@ -49,7 +124,7 @@ setup_keepalive() {
     echo "设置保活功能..."
     
     # 创建保活脚本
-    cat > "$KEEPALIVE_SCRIPT" << 'EOF'
+    cat > "$KEEPALIVE_SCRIPT" << EOF
 #!/bin/sh
 # 3proxy保活脚本
 
@@ -61,10 +136,10 @@ if ! rc-service 3proxy status >/dev/null 2>&1; then
 fi
 
 # 检查端口是否开放
-PORT=$(grep "socks -p" /etc/3proxy/3proxy.cfg | sed -E 's/socks -p([0-9]+)/\1/')
-if [ -n "$PORT" ]; then
-    if ! netstat -tulpn | grep ":$PORT" | grep "3proxy" >/dev/null 2>&1; then
-        logger -t "3proxy_keepalive" "检测到端口 $PORT 未开放，正在重启3proxy..."
+PORT=\$(grep "socks -p" /etc/3proxy/3proxy.cfg | sed -E 's/socks -p([0-9]+)/\\1/')
+if [ -n "\$PORT" ]; then
+    if ! netstat -tulpn | grep ":\$PORT" | grep "3proxy" >/dev/null 2>&1; then
+        logger -t "3proxy_keepalive" "检测到端口 \$PORT 未开放，正在重启3proxy..."
         rc-service 3proxy restart
         logger -t "3proxy_keepalive" "3proxy服务已重启"
     fi
@@ -89,10 +164,29 @@ EOF
     echo "保活功能设置完成，每15分钟将检查一次代理服务状态。"
 }
 
-# 生成随机字符串
+# 生成随机字符串 - 提供备选方案
 generate_random_string() {
     length=$1
-    openssl rand -base64 48 | tr -dc 'a-zA-Z0-9' | head -c "$length"
+    
+    # 首先尝试使用openssl生成随机字符串
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 48 | tr -dc 'a-zA-Z0-9' | head -c "$length"
+    else
+        # 如果openssl不可用，使用/dev/urandom作为备用
+        if [ -c /dev/urandom ]; then
+            cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c "$length"
+        else
+            # 最后的备用方法，使用$RANDOM
+            local result=""
+            local chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            local char_count=${#chars}
+            for i in $(seq 1 "$length"); do
+                local idx=$((RANDOM % char_count))
+                result="${result}${chars:idx:1}"
+            done
+            echo "$result"
+        fi
+    fi
 }
 
 # 生成随机端口 (1024-65535)
@@ -104,16 +198,25 @@ generate_random_port() {
 create_service_script() {
     echo "配置服务启动脚本..."
     
-    # 创建OpenRC服务文件（如果不存在）
-    if [ ! -f /etc/init.d/3proxy ]; then
-        cat > /etc/init.d/3proxy << 'EOF'
+    # 确保我们知道3proxy的路径
+    if [ -z "$PROXY_BIN" ]; then
+        find_3proxy_path
+    fi
+    
+    if [ -z "$PROXY_BIN" ]; then
+        echo "错误: 无法找到3proxy可执行文件路径，无法创建服务脚本"
+        exit 1
+    fi
+    
+    # 创建OpenRC服务文件
+    cat > /etc/init.d/3proxy << EOF
 #!/sbin/openrc-run
 
 name="3proxy"
 description="Tiny free proxy server"
-command="/usr/bin/3proxy"
+command="$PROXY_BIN"
 command_args="/etc/3proxy/3proxy.cfg"
-pidfile="/run/${RC_SVCNAME}.pid"
+pidfile="/run/\${RC_SVCNAME}.pid"
 command_background="yes"
 
 depend() {
@@ -125,8 +228,12 @@ start_pre() {
     checkpath --directory --owner root:root --mode 0755 /var/log
 }
 EOF
-        chmod +x /etc/init.d/3proxy
-    fi
+    chmod +x /etc/init.d/3proxy
+    
+    # 添加到默认运行级别
+    rc-update add 3proxy default 2>/dev/null
+    
+    echo "服务脚本已创建: /etc/init.d/3proxy"
 }
 
 # 创建代理配置
@@ -134,6 +241,9 @@ create_proxy_config() {
     local port=$1
     local username=$2
     local password=$3
+    
+    # 确保配置目录存在
+    mkdir -p /etc/3proxy
     
     # 创建配置文件
     cat > "$CONFIG_FILE" << EOF
@@ -164,6 +274,8 @@ EOF
     
     # 设置权限
     chmod 600 "$CONFIG_FILE"
+    
+    echo "代理配置文件已创建: $CONFIG_FILE"
 }
 
 # 配置随机代理
@@ -223,18 +335,41 @@ configure_custom_proxy() {
 # 重启代理服务
 restart_proxy() {
     echo "重启代理服务..."
-    if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
-        rc-service "$SERVICE_NAME" restart
+    
+    # 确保服务脚本存在
+    if [ ! -f /etc/init.d/3proxy ]; then
+        create_service_script
+    fi
+    
+    # 尝试停止服务（如果正在运行）
+    rc-service "$SERVICE_NAME" stop 2>/dev/null
+    
+    # 启动服务
+    if rc-service "$SERVICE_NAME" start; then
+        echo "代理服务已成功启动!"
     else
-        rc-service "$SERVICE_NAME" start
+        echo "代理服务启动失败，尝试手动启动..."
+        # 尝试直接运行3proxy
+        if [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ]; then
+            $PROXY_BIN "$CONFIG_FILE" &
+            echo "已尝试手动启动3proxy，状态:"
+            ps aux | grep 3proxy | grep -v grep
+        else
+            echo "错误: 无法启动3proxy服务"
+        fi
     fi
     
     # 等待服务启动
     sleep 2
-    if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
-        echo "代理服务已重启!"
-    else
-        echo "代理服务启动失败，请检查配置。"
+    
+    # 检查端口是否开放
+    PORT=$(grep "socks -p" "$CONFIG_FILE" | sed -E 's/socks -p([0-9]+)/\1/')
+    if [ -n "$PORT" ]; then
+        if netstat -tulpn | grep ":$PORT" >/dev/null; then
+            echo "端口 $PORT 已开放，代理服务正常运行!"
+        else
+            echo "警告: 端口 $PORT 未开放，服务可能未正确启动"
+        fi
     fi
 }
 
@@ -252,7 +387,7 @@ view_proxy_info() {
         
         # 显示服务状态
         echo "服务状态:"
-        rc-service "$SERVICE_NAME" status
+        rc-service "$SERVICE_NAME" status || echo "服务未运行"
         
         # 检查端口是否开放
         PORT=$(grep "socks -p" "$CONFIG_FILE" | sed -E 's/socks -p([0-9]+)/\1/')
@@ -292,14 +427,6 @@ configure_firewall() {
             ufw allow "$PORT"/tcp
             echo "已添加ufw规则允许端口 $PORT"
         fi
-    fi
-}
-
-# 安装netstat命令
-install_netstat() {
-    if ! command -v netstat >/dev/null 2>&1; then
-        echo "正在安装netstat命令..."
-        apk add net-tools
     fi
 }
 
@@ -345,7 +472,6 @@ show_menu() {
 auto_install() {
     echo "正在执行自动安装..."
     install_required_software
-    install_netstat
     create_service_script
     setup_keepalive
     configure_random_proxy
@@ -356,9 +482,8 @@ auto_install() {
 
 # 主程序入口
 main() {
-    # 确保已安装所需软件
+    # 首先确保安装所需软件 - 移到最前面执行
     install_required_software
-    install_netstat
     
     # 创建服务启动脚本
     create_service_script
@@ -398,4 +523,5 @@ main() {
 
 # 执行主程序
 main "$@"
+
 
