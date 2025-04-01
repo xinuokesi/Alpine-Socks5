@@ -20,6 +20,7 @@ SERVICE_NAME="3proxy"
 CONFIG_INFO="/etc/3proxy/proxy_info.txt"
 KEEPALIVE_SCRIPT="/etc/periodic/15min/3proxy_keepalive"
 PROXY_BIN=""  # 将由脚本自动检测
+PUBLIC_IP=""  # 公网IP地址
 
 # 检测是否通过管道执行
 is_pipe_execution() {
@@ -69,7 +70,7 @@ install_required_software() {
     apk update
     
     # 首先安装基本工具
-    apk add curl net-tools openssl
+    apk add curl net-tools openssl lsof
     
     # 安装3proxy并验证
     echo "正在安装3proxy..."
@@ -110,6 +111,9 @@ install_required_software() {
     # 创建配置目录
     mkdir -p /etc/3proxy
     mkdir -p /etc/periodic/15min
+    mkdir -p /var/log
+    touch /var/log/3proxy.log
+    chmod 644 /var/log/3proxy.log
     
     # 确保3proxy服务设置
     if [ -f /etc/init.d/3proxy ]; then
@@ -117,6 +121,25 @@ install_required_software() {
     else
         echo "将创建3proxy服务脚本"
     fi
+}
+
+# 获取公网IP地址
+get_public_ip() {
+    echo "正在获取公网IP地址..."
+    # 尝试多种服务来获取公网IP
+    PUBLIC_IP=$(curl -s -4 https://api.ipify.org 2>/dev/null || 
+                curl -s -4 https://ifconfig.me 2>/dev/null || 
+                curl -s -4 https://ip.3322.net 2>/dev/null || 
+                curl -s -4 https://ipinfo.io/ip 2>/dev/null ||
+                curl -s -4 https://ipecho.net/plain 2>/dev/null)
+    
+    # 如果无法获取公网IP，使用本地IP
+    if [ -z "$PUBLIC_IP" ]; then
+        echo "无法获取公网IP，将使用本地IP"
+        PUBLIC_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v "127.0.0.1" | head -n 1)
+    fi
+    
+    echo "检测到IP地址: $PUBLIC_IP"
 }
 
 # 设置保活功能
@@ -129,16 +152,39 @@ setup_keepalive() {
 # 3proxy保活脚本
 
 # 检查3proxy是否运行
-if ! rc-service 3proxy status >/dev/null 2>&1; then
-    logger -t "3proxy_keepalive" "检测到3proxy服务未运行，正在重启..."
-    rc-service 3proxy restart
-    logger -t "3proxy_keepalive" "3proxy服务已重启"
+if ! pgrep -f 3proxy >/dev/null 2>&1; then
+    logger -t "3proxy_keepalive" "检测到3proxy进程未运行，正在重启..."
+    
+    # 检查是否有配置文件
+    if [ -f /etc/3proxy/3proxy.cfg ]; then
+        # 先尝试通过服务重启
+        rc-service 3proxy restart
+        
+        # 检查是否重启成功
+        if ! pgrep -f 3proxy >/dev/null 2>&1; then
+            # 服务方式失败，尝试直接运行
+            logger -t "3proxy_keepalive" "服务重启失败，尝试手动启动"
+            if [ -x "$PROXY_BIN" ]; then
+                $PROXY_BIN /etc/3proxy/3proxy.cfg
+            else
+                # 使用全局变量可能会有问题，再次查找路径
+                PROXY_PATH=\$(which 3proxy 2>/dev/null || find / -name "3proxy" -type f -executable 2>/dev/null | head -n 1)
+                if [ -n "\$PROXY_PATH" ]; then
+                    \$PROXY_PATH /etc/3proxy/3proxy.cfg
+                fi
+            fi
+        fi
+        
+        logger -t "3proxy_keepalive" "3proxy服务已尝试重启"
+    else
+        logger -t "3proxy_keepalive" "配置文件不存在，无法重启服务"
+    fi
 fi
 
 # 检查端口是否开放
 PORT=\$(grep "socks -p" /etc/3proxy/3proxy.cfg | sed -E 's/socks -p([0-9]+)/\\1/')
 if [ -n "\$PORT" ]; then
-    if ! netstat -tulpn | grep ":\$PORT" | grep "3proxy" >/dev/null 2>&1; then
+    if ! (netstat -tln | grep ":\$PORT " >/dev/null 2>&1 || lsof -i :\$PORT >/dev/null 2>&1); then
         logger -t "3proxy_keepalive" "检测到端口 \$PORT 未开放，正在重启3proxy..."
         rc-service 3proxy restart
         logger -t "3proxy_keepalive" "3proxy服务已重启"
@@ -157,7 +203,7 @@ EOF
     fi
     
     # 确保crond服务运行
-    if ! rc-service dcron status >/dev/null 2>&1; then
+    if ! pgrep crond >/dev/null 2>&1; then
         rc-service dcron start
     fi
     
@@ -247,7 +293,7 @@ create_proxy_config() {
     
     # 创建配置文件
     cat > "$CONFIG_FILE" << EOF
-#!/bin/3proxy
+# 3proxy配置文件
 daemon
 nscache 65536
 timeouts 1 5 30 60 180 1800 15 60
@@ -256,6 +302,7 @@ logformat "- +_L%t.%. %N.%p %E %U %C:%c %R:%r %O %I %h %T"
 auth strong
 users $username:CL:$password
 allow $username
+# 监听在所有接口上
 socks -p$port
 EOF
 
@@ -332,6 +379,47 @@ configure_custom_proxy() {
     view_proxy_info
 }
 
+# 检查日志文件错误
+check_log_for_errors() {
+    echo "检查服务日志中的错误..."
+    if [ -f /var/log/3proxy.log ]; then
+        tail -n 20 /var/log/3proxy.log
+    else
+        echo "日志文件不存在"
+    fi
+    
+    # 尝试直接运行3proxy查看错误输出
+    if [ -n "$PROXY_BIN" ]; then
+        echo "尝试手动运行3proxy以查看错误:"
+        $PROXY_BIN -d -f "$CONFIG_FILE"
+    fi
+}
+
+# 直接启动3proxy（不使用服务）
+start_proxy_directly() {
+    if [ -z "$PROXY_BIN" ]; then
+        find_3proxy_path
+    fi
+    
+    if [ -n "$PROXY_BIN" ] && [ -f "$CONFIG_FILE" ]; then
+        echo "尝试直接启动3proxy..."
+        $PROXY_BIN "$CONFIG_FILE" &
+        sleep 2
+        
+        # 检查是否成功启动
+        if pgrep -f 3proxy >/dev/null; then
+            echo "3proxy已成功直接启动!"
+            return 0
+        else
+            echo "直接启动失败!"
+            return 1
+        fi
+    else
+        echo "无法直接启动3proxy: 可执行文件或配置文件不存在"
+        return 1
+    fi
+}
+
 # 重启代理服务
 restart_proxy() {
     echo "重启代理服务..."
@@ -341,34 +429,46 @@ restart_proxy() {
         create_service_script
     fi
     
-    # 尝试停止服务（如果正在运行）
-    rc-service "$SERVICE_NAME" stop 2>/dev/null
+    # 先尝试停止所有3proxy进程
+    pkill -f 3proxy 2>/dev/null
     
-    # 启动服务
+    # 尝试启动服务
     if rc-service "$SERVICE_NAME" start; then
-        echo "代理服务已成功启动!"
+        echo "代理服务已通过服务管理器成功启动!"
     else
-        echo "代理服务启动失败，尝试手动启动..."
-        # 尝试直接运行3proxy
-        if [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ]; then
-            $PROXY_BIN "$CONFIG_FILE" &
-            echo "已尝试手动启动3proxy，状态:"
-            ps aux | grep 3proxy | grep -v grep
+        echo "服务启动失败，检查错误并尝试直接启动..."
+        check_log_for_errors
+        
+        # 尝试直接启动
+        if start_proxy_directly; then
+            echo "成功通过直接启动方式运行3proxy!"
         else
-            echo "错误: 无法启动3proxy服务"
+            echo "错误: 无法启动3proxy服务，请检查配置和日志"
         fi
     fi
     
-    # 等待服务启动
-    sleep 2
+    # 检查3proxy进程
+    if pgrep -f 3proxy >/dev/null; then
+        echo "确认3proxy进程正在运行:"
+        ps aux | grep 3proxy | grep -v grep
+    else
+        echo "警告: 未检测到3proxy进程运行"
+    fi
     
     # 检查端口是否开放
     PORT=$(grep "socks -p" "$CONFIG_FILE" | sed -E 's/socks -p([0-9]+)/\1/')
     if [ -n "$PORT" ]; then
-        if netstat -tulpn | grep ":$PORT" >/dev/null; then
-            echo "端口 $PORT 已开放，代理服务正常运行!"
+        echo "检查端口 $PORT 是否开放..."
+        
+        # 使用多种方法检查端口
+        if netstat -tln | grep ":$PORT " >/dev/null; then
+            echo "使用netstat确认端口 $PORT 已开放"
+        elif command -v lsof >/dev/null && lsof -i ":$PORT" >/dev/null; then
+            echo "使用lsof确认端口 $PORT 已开放"
+        elif nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+            echo "使用nc确认端口 $PORT 已开放"
         else
-            echo "警告: 端口 $PORT 未开放，服务可能未正确启动"
+            echo "警告: 端口 $PORT 似乎未开放，可能需要检查配置或防火墙"
         fi
     fi
 }
@@ -379,21 +479,38 @@ view_proxy_info() {
         echo "=== 当前代理配置 ==="
         cat "$CONFIG_INFO"
         
-        # 显示服务器IP
+        # 获取并显示服务器IP
         echo ""
         echo "服务器IP地址:"
+        
+        # 显示本地IP
+        echo "本地IP:"
         ip addr | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1
+        
+        # 获取并显示公网IP
+        if [ -z "$PUBLIC_IP" ]; then
+            get_public_ip
+        fi
+        
+        if [ -n "$PUBLIC_IP" ]; then
+            echo "公网IP: $PUBLIC_IP"
+        fi
+        
         echo "===================="
         
         # 显示服务状态
         echo "服务状态:"
-        rc-service "$SERVICE_NAME" status || echo "服务未运行"
+        rc-service "$SERVICE_NAME" status || echo "服务未通过服务管理器运行"
+        
+        # 检查3proxy进程
+        echo "3proxy进程状态:"
+        ps aux | grep 3proxy | grep -v grep || echo "未找到3proxy进程"
         
         # 检查端口是否开放
         PORT=$(grep "socks -p" "$CONFIG_FILE" | sed -E 's/socks -p([0-9]+)/\1/')
         if [ -n "$PORT" ]; then
             echo "端口状态 ($PORT):"
-            netstat -tulpn | grep ":$PORT" || echo "端口 $PORT 未开放"
+            (netstat -tln | grep ":$PORT " || lsof -i ":$PORT" 2>/dev/null) || echo "端口 $PORT 未检测到开放"
         fi
         echo "===================="
     else
@@ -445,6 +562,8 @@ show_menu() {
     echo "3. 重启代理服务"
     echo "4. 查看当前代理配置"
     echo "5. 检查/重启保活功能"
+    echo "6. 手动启动代理（不使用服务）"
+    echo "7. 检查服务日志"
     echo "0. 退出"
     echo "=============================="
     echo -n "请选择: "
@@ -456,6 +575,8 @@ show_menu() {
         3) restart_proxy ;;
         4) view_proxy_info ;;
         5) setup_keepalive && echo "保活功能已重新配置" ;;
+        6) start_proxy_directly ;;
+        7) check_log_for_errors ;;
         0) exit 0 ;;
         *) echo "无效选择，请重试。" ;;
     esac
@@ -472,6 +593,7 @@ show_menu() {
 auto_install() {
     echo "正在执行自动安装..."
     install_required_software
+    get_public_ip
     create_service_script
     setup_keepalive
     configure_random_proxy
@@ -484,6 +606,9 @@ auto_install() {
 main() {
     # 首先确保安装所需软件 - 移到最前面执行
     install_required_software
+    
+    # 获取公网IP
+    get_public_ip
     
     # 创建服务启动脚本
     create_service_script
@@ -523,5 +648,3 @@ main() {
 
 # 执行主程序
 main "$@"
-
-
