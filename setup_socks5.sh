@@ -20,6 +20,16 @@ SERVICE_NAME="3proxy"
 CONFIG_INFO="/etc/3proxy/proxy_info.txt"
 KEEPALIVE_SCRIPT="/etc/periodic/15min/3proxy_keepalive"
 
+# 检测是否通过管道执行
+is_pipe_execution() {
+    # 检查标准输入是否为终端
+    if [ ! -t 0 ]; then
+        return 0  # 是管道执行
+    else
+        return 1  # 不是管道执行
+    fi
+}
+
 # 安装必要的软件
 install_required_software() {
     echo "正在安装必要的软件..."
@@ -175,25 +185,32 @@ configure_random_proxy() {
 configure_custom_proxy() {
     echo "配置自定义代理..."
     
-    echo -n "请输入端口号 (1024-65535): "
-    read -r port
-    
-    # 验证端口
-    if ! [ "$port" -eq "$port" ] 2>/dev/null || [ "$port" -lt 1024 ] || [ "$port" -gt 65535 ]; then
-        echo "无效的端口号，使用随机端口。"
+    # 如果是管道执行，使用默认值
+    if is_pipe_execution; then
         port=$(generate_random_port)
-    fi
-    
-    echo -n "请输入用户名 (留空则随机生成): "
-    read -r username
-    if [ -z "$username" ]; then
         username=$(generate_random_string 8)
-    fi
-    
-    echo -n "请输入密码 (留空则随机生成): "
-    read -r password
-    if [ -z "$password" ]; then
         password=$(generate_random_string 12)
+    else
+        echo -n "请输入端口号 (1024-65535): "
+        read -r port
+        
+        # 验证端口
+        if ! [ "$port" -eq "$port" ] 2>/dev/null || [ "$port" -lt 1024 ] || [ "$port" -gt 65535 ]; then
+            echo "无效的端口号，使用随机端口。"
+            port=$(generate_random_port)
+        fi
+        
+        echo -n "请输入用户名 (留空则随机生成): "
+        read -r username
+        if [ -z "$username" ]; then
+            username=$(generate_random_string 8)
+        fi
+        
+        echo -n "请输入密码 (留空则随机生成): "
+        read -r password
+        if [ -z "$password" ]; then
+            password=$(generate_random_string 12)
+        fi
     fi
     
     create_proxy_config "$port" "$username" "$password"
@@ -288,6 +305,12 @@ install_netstat() {
 
 # 主菜单
 show_menu() {
+    # 如果是通过管道执行，直接自动安装
+    if is_pipe_execution; then
+        auto_install
+        exit 0
+    fi
+
     clear
     echo "===== Alpine Socks5代理配置工具 ====="
     echo "1. 配置随机端口和凭据的代理"
@@ -310,10 +333,12 @@ show_menu() {
         *) echo "无效选择，请重试。" ;;
     esac
     
-    echo ""
-    echo "按Enter键继续..."
-    read -r
-    show_menu
+    if ! is_pipe_execution; then
+        echo ""
+        echo "按Enter键继续..."
+        read -r
+        show_menu
+    fi
 }
 
 # 自动安装函数
@@ -347,17 +372,23 @@ main() {
         restart_proxy
         configure_firewall
         view_proxy_info
-        if [ "$1" != "--auto" ]; then
+        if [ ! is_pipe_execution ] && [ "$1" != "--auto" ]; then
             echo "按Enter键继续..."
             read -r
         fi
     fi
     
-    # 检查是否为自动安装模式
+    # 检查命令行参数
     if [ "$1" = "--auto" ]; then
         if [ ! -f "$CONFIG_FILE" ]; then
             auto_install
         fi
+        exit 0
+    fi
+    
+    # 检查是否通过管道执行
+    if is_pipe_execution; then
+        auto_install
         exit 0
     fi
     
@@ -367,3 +398,4 @@ main() {
 
 # 执行主程序
 main "$@"
+
