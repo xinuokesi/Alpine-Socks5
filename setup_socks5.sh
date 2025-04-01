@@ -1,6 +1,5 @@
 #!/bin/sh
-# Alpine Socks5代理一键安装脚本 - 支持保活和开机自启
-# 支持通过GitHub一键安装: curl -fsSL https://raw.githubusercontent.com/xinuokesi/Alpine-Socks5/main/setup_socks5.sh | sh
+# Alpine Socks5代理一键安装脚本
 
 # 检查是否为root用户
 if [ "$(id -u)" -ne 0 ]; then
@@ -32,36 +31,68 @@ is_pipe_execution() {
     fi
 }
 
+# 检查文件是否为真正的3proxy可执行文件（不是服务脚本）
+is_real_3proxy_binary() {
+    file_path="$1"
+    
+    # 检查文件是否存在且可执行
+    if [ ! -f "$file_path" ] || [ ! -x "$file_path" ]; then
+        return 1
+    fi
+    
+    # 检查文件类型
+    file_type=$(file -b "$file_path" 2>/dev/null)
+    
+    # 检查是否为脚本文件（服务脚本通常是shell脚本）
+    if echo "$file_type" | grep -q "shell script"; then
+        # 检查文件内容，如果包含OpenRC相关内容，则不是真正的3proxy
+        if grep -q "openrc-run" "$file_path" || grep -q "Usage: 3proxy" "$file_path"; then
+            return 1
+        fi
+    fi
+    
+    # 如果是二进制文件，大概率是正确的
+    if echo "$file_type" | grep -q "ELF" || echo "$file_type" | grep -q "executable"; then
+        return 0
+    fi
+    
+    # 默认假设不是真正的3proxy
+    return 1
+}
+
 # 查找3proxy可执行文件的路径
 find_3proxy_path() {
     echo "正在检测3proxy安装路径..."
-    # 尝试使用which查找
-    PROXY_BIN=$(which 3proxy 2>/dev/null)
     
-    # 如果which找不到，尝试在常见位置搜索
-    if [ -z "$PROXY_BIN" ]; then
-        for path in "/usr/bin/3proxy" "/usr/sbin/3proxy" "/usr/local/bin/3proxy" "/usr/local/sbin/3proxy" "/bin/3proxy" "/sbin/3proxy"; do
-            if [ -x "$path" ]; then
-                PROXY_BIN="$path"
-                break
-            fi
-        done
-    fi
+    # 先尝试在常见位置搜索
+    for path in "/usr/bin/3proxy" "/usr/sbin/3proxy" "/usr/local/bin/3proxy" "/usr/local/sbin/3proxy" "/bin/3proxy" "/sbin/3proxy"; do
+        if [ -x "$path" ] && is_real_3proxy_binary "$path"; then
+            PROXY_BIN="$path"
+            echo "找到3proxy可执行文件: $PROXY_BIN"
+            return 0
+        fi
+    done
     
-    # 如果仍然找不到，使用find命令
-    if [ -z "$PROXY_BIN" ]; then
-        echo "在常见位置未找到3proxy，正在全盘搜索..."
-        PROXY_BIN=$(find / -name "3proxy" -type f -executable 2>/dev/null | head -n 1)
-    fi
-    
-    # 验证找到的路径
-    if [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ]; then
+    # 使用which命令查找
+    possible_path=$(which 3proxy 2>/dev/null)
+    if [ -n "$possible_path" ] && is_real_3proxy_binary "$possible_path"; then
+        PROXY_BIN="$possible_path"
         echo "找到3proxy可执行文件: $PROXY_BIN"
         return 0
-    else
-        echo "未找到可执行的3proxy，将尝试安装"
-        return 1
     fi
+    
+    # 如果仍然找不到，使用find命令搜索整个系统
+    echo "在常见位置未找到3proxy，正在全盘搜索..."
+    for found_path in $(find / -name "3proxy" -type f -executable 2>/dev/null); do
+        if is_real_3proxy_binary "$found_path"; then
+            PROXY_BIN="$found_path"
+            echo "找到3proxy可执行文件: $PROXY_BIN"
+            return 0
+        fi
+    done
+    
+    echo "未找到可执行的3proxy，将尝试安装"
+    return 1
 }
 
 # 安装必要的软件 - 确保在其他功能之前调用
@@ -70,7 +101,7 @@ install_required_software() {
     apk update
     
     # 首先安装基本工具
-    apk add curl net-tools openssl lsof
+    apk add curl net-tools openssl lsof file
     
     # 安装3proxy并验证
     echo "正在安装3proxy..."
@@ -114,13 +145,6 @@ install_required_software() {
     mkdir -p /var/log
     touch /var/log/3proxy.log
     chmod 644 /var/log/3proxy.log
-    
-    # 确保3proxy服务设置
-    if [ -f /etc/init.d/3proxy ]; then
-        rc-update add 3proxy default 2>/dev/null
-    else
-        echo "将创建3proxy服务脚本"
-    fi
 }
 
 # 获取公网IP地址
@@ -146,6 +170,11 @@ get_public_ip() {
 setup_keepalive() {
     echo "设置保活功能..."
     
+    # 确保我们有正确的3proxy路径
+    if [ -z "$PROXY_BIN" ]; then
+        find_3proxy_path
+    fi
+    
     # 创建保活脚本
     cat > "$KEEPALIVE_SCRIPT" << EOF
 #!/bin/sh
@@ -165,12 +194,12 @@ if ! pgrep -f 3proxy >/dev/null 2>&1; then
             # 服务方式失败，尝试直接运行
             logger -t "3proxy_keepalive" "服务重启失败，尝试手动启动"
             if [ -x "$PROXY_BIN" ]; then
-                $PROXY_BIN /etc/3proxy/3proxy.cfg
+                cd /etc/3proxy && $PROXY_BIN
             else
                 # 使用全局变量可能会有问题，再次查找路径
-                PROXY_PATH=\$(which 3proxy 2>/dev/null || find / -name "3proxy" -type f -executable 2>/dev/null | head -n 1)
-                if [ -n "\$PROXY_PATH" ]; then
-                    \$PROXY_PATH /etc/3proxy/3proxy.cfg
+                PROXY_PATH=\$(which 3proxy 2>/dev/null)
+                if [ -n "\$PROXY_PATH" ] && [ -x "\$PROXY_PATH" ] && ! echo "\$PROXY_PATH" | grep -q "init.d"; then
+                    cd /etc/3proxy && \$PROXY_PATH
                 fi
             fi
         fi
@@ -182,7 +211,7 @@ if ! pgrep -f 3proxy >/dev/null 2>&1; then
 fi
 
 # 检查端口是否开放
-PORT=\$(grep "socks -p" /etc/3proxy/3proxy.cfg | sed -E 's/socks -p([0-9]+)/\\1/')
+PORT=\$(grep "^socks" /etc/3proxy/3proxy.cfg | grep -oE "[0-9]+" | head -n 1)
 if [ -n "\$PORT" ]; then
     if ! (netstat -tln | grep ":\$PORT " >/dev/null 2>&1 || lsof -i :\$PORT >/dev/null 2>&1); then
         logger -t "3proxy_keepalive" "检测到端口 \$PORT 未开放，正在重启3proxy..."
@@ -261,13 +290,18 @@ create_service_script() {
 name="3proxy"
 description="Tiny free proxy server"
 command="$PROXY_BIN"
-command_args="/etc/3proxy/3proxy.cfg"
 pidfile="/run/\${RC_SVCNAME}.pid"
 command_background="yes"
 
 depend() {
     need net
     after firewall
+}
+
+start() {
+    ebegin "Starting \$name"
+    cd /etc/3proxy && \$command
+    eend \$?
 }
 
 start_pre() {
@@ -291,9 +325,9 @@ create_proxy_config() {
     # 确保配置目录存在
     mkdir -p /etc/3proxy
     
-    # 创建配置文件
+    # 创建配置文件 - 注意格式符合3proxy要求
     cat > "$CONFIG_FILE" << EOF
-# 3proxy配置文件
+#!/usr/bin/env 3proxy
 daemon
 nscache 65536
 timeouts 1 5 30 60 180 1800 15 60
@@ -302,7 +336,6 @@ logformat "- +_L%t.%. %N.%p %E %U %C:%c %R:%r %O %I %h %T"
 auth strong
 users $username:CL:$password
 allow $username
-# 监听在所有接口上
 socks -p$port
 EOF
 
@@ -320,9 +353,29 @@ EOF
     chmod 600 "$CONFIG_INFO"
     
     # 设置权限
-    chmod 600 "$CONFIG_FILE"
+    chmod 755 "$CONFIG_FILE"
     
     echo "代理配置文件已创建: $CONFIG_FILE"
+}
+
+# 创建备用独立配置
+create_standalone_config() {
+    local port=$1
+    local username=$2
+    local password=$3
+    
+    # 创建一个更简单的配置文件，用于直接启动
+    cat > "/etc/3proxy/3proxy.standalone.cfg" << EOF
+auth strong
+users $username:CL:$password
+allow $username
+log /var/log/3proxy.log
+logformat "L%d-%m-%Y %H:%M:%S %z %N.%p %E %U %C:%c %R:%r %O %I %h %T"
+socks -p$port
+EOF
+
+    chmod 755 "/etc/3proxy/3proxy.standalone.cfg"
+    echo "已创建备用独立配置文件: /etc/3proxy/3proxy.standalone.cfg"
 }
 
 # 配置随机代理
@@ -334,6 +387,7 @@ configure_random_proxy() {
     password=$(generate_random_string 12)
     
     create_proxy_config "$port" "$username" "$password"
+    create_standalone_config "$port" "$username" "$password"
     restart_proxy
     
     echo "随机代理已配置完成!"
@@ -373,6 +427,7 @@ configure_custom_proxy() {
     fi
     
     create_proxy_config "$port" "$username" "$password"
+    create_standalone_config "$port" "$username" "$password"
     restart_proxy
     
     echo "自定义代理已配置完成!"
@@ -388,10 +443,13 @@ check_log_for_errors() {
         echo "日志文件不存在"
     fi
     
-    # 尝试直接运行3proxy查看错误输出
+    # 尝试获取3proxy配置示例或用法
     if [ -n "$PROXY_BIN" ]; then
-        echo "尝试手动运行3proxy以查看错误:"
-        $PROXY_BIN -d -f "$CONFIG_FILE"
+        echo "查看3proxy帮助信息:"
+        $PROXY_BIN -h 2>&1 || $PROXY_BIN --help 2>&1 || $PROXY_BIN 2>&1
+        
+        echo "检查配置文件内容:"
+        cat "$CONFIG_FILE"
     fi
 }
 
@@ -403,7 +461,14 @@ start_proxy_directly() {
     
     if [ -n "$PROXY_BIN" ] && [ -f "$CONFIG_FILE" ]; then
         echo "尝试直接启动3proxy..."
-        $PROXY_BIN "$CONFIG_FILE" &
+        
+        # 停止任何现有的3proxy进程
+        pkill -f 3proxy 2>/dev/null
+        
+        # 根据目录直接运行3proxy（不使用配置文件路径参数）
+        cd /etc/3proxy/
+        $PROXY_BIN &
+        
         sleep 2
         
         # 检查是否成功启动
@@ -411,8 +476,21 @@ start_proxy_directly() {
             echo "3proxy已成功直接启动!"
             return 0
         else
-            echo "直接启动失败!"
-            return 1
+            echo "直接启动失败! 尝试其他启动方式..."
+            
+            # 尝试不同的启动方式
+            echo "尝试方法2: 使用备用配置文件"
+            cd /etc/3proxy/
+            $PROXY_BIN 3proxy.standalone.cfg &
+            sleep 1
+            
+            if pgrep -f 3proxy >/dev/null; then
+                echo "3proxy已成功以方法2启动!"
+                return 0
+            else
+                echo "所有方法都失败了!"
+                return 1
+            fi
         fi
     else
         echo "无法直接启动3proxy: 可执行文件或配置文件不存在"
@@ -429,20 +507,58 @@ restart_proxy() {
         create_service_script
     fi
     
+    # 获取当前配置
+    PORT=$(grep "socks -p" "$CONFIG_FILE" 2>/dev/null | sed -E 's/socks -p([0-9]+)/\1/')
+    USERNAME=$(grep "users" "$CONFIG_FILE" 2>/dev/null | cut -d: -f1 | awk '{print $2}')
+    PASSWORD=$(grep "users" "$CONFIG_FILE" 2>/dev/null | cut -d: -f3 | awk '{print $1}')
+    
+    # 如果配置不完整，尝试从INFO文件获取
+    if [ -z "$PORT" ] || [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+        if [ -f "$CONFIG_INFO" ]; then
+            echo "从备份信息恢复配置..."
+            PORT=$(grep "端口:" "$CONFIG_INFO" | awk '{print $2}')
+            USERNAME=$(grep "用户名:" "$CONFIG_INFO" | awk '{print $2}')
+            PASSWORD=$(grep "密码:" "$CONFIG_INFO" | awk '{print $2}')
+        fi
+    fi
+    
+    # 如果仍然不完整，使用默认值
+    if [ -z "$PORT" ]; then
+        PORT=$(generate_random_port)
+    fi
+    if [ -z "$USERNAME" ]; then
+        USERNAME=$(generate_random_string 8)
+    fi
+    if [ -z "$PASSWORD" ]; then
+        PASSWORD=$(generate_random_string 12)
+    fi
+    
     # 先尝试停止所有3proxy进程
     pkill -f 3proxy 2>/dev/null
+    sleep 1
     
     # 尝试启动服务
+    echo "尝试通过服务启动3proxy..."
     if rc-service "$SERVICE_NAME" start; then
         echo "代理服务已通过服务管理器成功启动!"
     else
-        echo "服务启动失败，检查错误并尝试直接启动..."
-        check_log_for_errors
+        echo "服务启动失败，尝试直接启动..."
         
         # 尝试直接启动
         if start_proxy_directly; then
             echo "成功通过直接启动方式运行3proxy!"
         else
+            echo "所有启动方法都失败，尝试诊断问题..."
+            echo "1. 检查3proxy二进制文件是否存在并可执行:"
+            find_3proxy_path
+            ls -la "$PROXY_BIN"
+            
+            echo "2. 测试3proxy是否可以直接运行:"
+            $PROXY_BIN -v 2>&1 || echo "无法运行3proxy二进制文件"
+            
+            echo "3. 检查配置文件:"
+            cat "$CONFIG_FILE"
+            
             echo "错误: 无法启动3proxy服务，请检查配置和日志"
         fi
     fi
@@ -456,7 +572,6 @@ restart_proxy() {
     fi
     
     # 检查端口是否开放
-    PORT=$(grep "socks -p" "$CONFIG_FILE" | sed -E 's/socks -p([0-9]+)/\1/')
     if [ -n "$PORT" ]; then
         echo "检查端口 $PORT 是否开放..."
         
@@ -547,6 +662,109 @@ configure_firewall() {
     fi
 }
 
+# 尝试多种方式启动3proxy
+try_all_startup_methods() {
+    echo "尝试所有可能的3proxy启动方法..."
+    
+    # 获取参数
+    local port=$1
+    local username=$2
+    local password=$3
+    
+    # 如果未提供参数，从配置获取
+    if [ -z "$port" ] || [ -z "$username" ] || [ -z "$password" ]; then
+        port=$(grep "端口:" "$CONFIG_INFO" 2>/dev/null | awk '{print $2}')
+        username=$(grep "用户名:" "$CONFIG_INFO" 2>/dev/null | awk '{print $2}')
+        password=$(grep "密码:" "$CONFIG_INFO" 2>/dev/null | awk '{print $2}')
+        
+        # 如果仍然为空，使用随机值
+        if [ -z "$port" ]; then port=$(generate_random_port); fi
+        if [ -z "$username" ]; then username=$(generate_random_string 8); fi
+        if [ -z "$password" ]; then password=$(generate_random_string 12); fi
+    fi
+    
+    # 停止任何现有的3proxy进程
+    pkill -f 3proxy 2>/dev/null
+    sleep 1
+    
+    # 查找3proxy可执行文件
+    if [ -z "$PROXY_BIN" ]; then
+        find_3proxy_path
+    fi
+    
+    if [ -z "$PROXY_BIN" ]; then
+        echo "错误: 找不到3proxy可执行文件"
+        return 1
+    fi
+    
+    echo "准备使用以下参数尝试启动3proxy:"
+    echo "二进制文件: $PROXY_BIN"
+    echo "端口: $port, 用户名: $username, 密码: ******"
+    
+    # 方法1: 使用临时配置文件直接运行3proxy
+    echo "尝试方法1: 使用临时配置文件"
+    local tmp_config="/tmp/3proxy.tmp.cfg"
+    cat > "$tmp_config" << EOF
+#!/usr/bin/3proxy
+auth strong
+users $username:CL:$password
+allow $username
+socks -p$port
+EOF
+    
+    chmod 755 "$tmp_config"
+    cd /tmp
+    $PROXY_BIN "$tmp_config" &
+    sleep 2
+    
+    if pgrep -f 3proxy >/dev/null; then
+        echo "方法1成功!"
+        # 保存成功的配置
+        cp "$tmp_config" "$CONFIG_FILE"
+        return 0
+    fi
+    
+    # 方法2: 使用命令行参数
+    echo "尝试方法2: 使用命令行参数"
+    $PROXY_BIN "auth strong" "users $username:CL:$password" "allow $username" "socks -p$port" &
+    sleep 2
+    
+    if pgrep -f 3proxy >/dev/null; then
+        echo "方法2成功!"
+        return 0
+    fi
+    
+    # 方法3: 最简单的配置
+    echo "尝试方法3: 最简单的配置"
+    local simple_config="/tmp/3proxy.simple.cfg"
+    echo "socks -p$port" > "$simple_config"
+    cd /tmp
+    $PROXY_BIN "$simple_config" &
+    sleep 2
+    
+    if pgrep -f 3proxy >/dev/null; then
+        echo "方法3成功!"
+        # 更新配置信息 (但不保存简单配置，因为没有验证)
+        echo "注意: 使用了简单配置，没有用户验证"
+        return 0
+    fi
+    
+    # 方法4: 不带参数直接运行
+    echo "尝试方法4: 不带参数直接运行"
+    cd /etc/3proxy
+    $PROXY_BIN &
+    sleep 2
+    
+    if pgrep -f 3proxy >/dev/null; then
+        echo "方法4成功!"
+        # 更新配置信息
+        return 0
+    fi
+    
+    echo "所有启动方法均失败!"
+    return 1
+}
+
 # 主菜单
 show_menu() {
     # 如果是通过管道执行，直接自动安装
@@ -564,6 +782,7 @@ show_menu() {
     echo "5. 检查/重启保活功能"
     echo "6. 手动启动代理（不使用服务）"
     echo "7. 检查服务日志"
+    echo "8. 尝试所有启动方法(紧急修复)"
     echo "0. 退出"
     echo "=============================="
     echo -n "请选择: "
@@ -577,6 +796,7 @@ show_menu() {
         5) setup_keepalive && echo "保活功能已重新配置" ;;
         6) start_proxy_directly ;;
         7) check_log_for_errors ;;
+        8) try_all_startup_methods ;;
         0) exit 0 ;;
         *) echo "无效选择，请重试。" ;;
     esac
