@@ -7,17 +7,17 @@
 ### 交互式安装
 
 ```bash
-wget -O - https://raw.githubusercontent.com/你的用户名/你的仓库名/main/setup_socks5.sh | sh
+wget -O - https://raw.githubusercontent.com/xinuokesi/Alpine-Socks5/main/setup_socks5.sh | sh
 ```
 
 ### 或者使用curl:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/你的用户名/你的仓库名/main/setup_socks5.sh | sh
+curl -fsSL https://raw.githubusercontent.com/xinuokesi/Alpine-Socks5/main/setup_socks5.sh | sh
 ```
 
 ### 自动安装（使用随机配置）
 
 ```bash
-wget -O - https://raw.githubusercontent.com/你的用户名/你的仓库名/main/setup_socks5.sh | sh -s -- --auto
+wget -O - https://raw.githubusercontent.com/xinuokesi/Alpine-Socks5/main/setup_socks5.sh | sh -s -- --auto
 ```
