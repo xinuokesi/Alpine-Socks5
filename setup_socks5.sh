@@ -1,5 +1,6 @@
 #!/bin/sh
-# Alpine Socks5代理一键安装脚本
+# Alpine Socks5代理一键安装脚本 - 支持保活和开机自启
+# 支持通过GitHub一键安装: curl -fsSL https://raw.githubusercontent.com/你的用户名/你的仓库名/main/setup_socks5.sh | sh
 
 # 检查是否为root用户
 if [ "$(id -u)" -ne 0 ]; then
@@ -40,19 +41,26 @@ is_real_3proxy_binary() {
         return 1
     fi
     
+    # 排除服务脚本路径
+    if echo "$file_path" | grep -q "/etc/init.d"; then
+        return 1
+    fi
+    
     # 检查文件类型
     file_type=$(file -b "$file_path" 2>/dev/null)
     
     # 检查是否为脚本文件（服务脚本通常是shell脚本）
     if echo "$file_type" | grep -q "shell script"; then
-        # 检查文件内容，如果包含OpenRC相关内容，则不是真正的3proxy
-        if grep -q "openrc-run" "$file_path" || grep -q "Usage: 3proxy" "$file_path"; then
-            return 1
-        fi
+        return 1
     fi
     
-    # 如果是二进制文件，大概率是正确的
+    # 检查是否为ELF二进制文件
     if echo "$file_type" | grep -q "ELF" || echo "$file_type" | grep -q "executable"; then
+        return 0
+    fi
+    
+    # 最后再尝试运行测试
+    if "$file_path" -h 2>&1 | grep -q "3proxy version"; then
         return 0
     fi
     
@@ -87,6 +95,16 @@ find_3proxy_path() {
         if is_real_3proxy_binary "$found_path"; then
             PROXY_BIN="$found_path"
             echo "找到3proxy可执行文件: $PROXY_BIN"
+            return 0
+        fi
+    done
+    
+    # 特殊场景：直接尝试使用apk获取文件列表
+    echo "尝试从安装包获取3proxy路径..."
+    for pkg_file in $(apk info -L 3proxy 2>/dev/null | grep -v "/etc/init.d" | grep "bin/3proxy$"); do
+        if [ -x "$pkg_file" ] && is_real_3proxy_binary "$pkg_file"; then
+            PROXY_BIN="$pkg_file"
+            echo "从安装包找到3proxy: $PROXY_BIN"
             return 0
         fi
     done
@@ -137,6 +155,15 @@ install_required_software() {
     if [ -z "$PROXY_BIN" ]; then
         echo "错误: 无法安装3proxy，请手动安装后再运行此脚本"
         exit 1
+    fi
+    
+    # 确保二进制文件正确
+    echo "最终确认3proxy二进制文件..."
+    if [ -n "$PROXY_BIN" ]; then
+        echo "3proxy二进制文件路径: $PROXY_BIN"
+        echo "文件类型: $(file -b "$PROXY_BIN")"
+        echo "尝试获取版本信息: "
+        $PROXY_BIN -v 2>&1 || echo "无法获取版本信息"
     fi
     
     # 创建配置目录
@@ -193,10 +220,11 @@ if ! pgrep -f 3proxy >/dev/null 2>&1; then
         if ! pgrep -f 3proxy >/dev/null 2>&1; then
             # 服务方式失败，尝试直接运行
             logger -t "3proxy_keepalive" "服务重启失败，尝试手动启动"
-            if [ -x "$PROXY_BIN" ]; then
-                cd /etc/3proxy && $PROXY_BIN
+            PROXY_PATH="$PROXY_BIN"
+            if [ -x "\$PROXY_PATH" ]; then
+                cd /etc/3proxy && \$PROXY_PATH
             else
-                # 使用全局变量可能会有问题，再次查找路径
+                # 尝试再次查找路径
                 PROXY_PATH=\$(which 3proxy 2>/dev/null)
                 if [ -n "\$PROXY_PATH" ] && [ -x "\$PROXY_PATH" ] && ! echo "\$PROXY_PATH" | grep -q "init.d"; then
                     cd /etc/3proxy && \$PROXY_PATH
@@ -444,23 +472,29 @@ check_log_for_errors() {
     fi
     
     # 尝试获取3proxy配置示例或用法
-    if [ -n "$PROXY_BIN" ]; then
+    if [ -n "$PROXY_BIN" ] && ! echo "$PROXY_BIN" | grep -q "init.d"; then
         echo "查看3proxy帮助信息:"
         $PROXY_BIN -h 2>&1 || $PROXY_BIN --help 2>&1 || $PROXY_BIN 2>&1
         
         echo "检查配置文件内容:"
         cat "$CONFIG_FILE"
+    else
+        echo "警告: 未找到有效的3proxy二进制程序，无法获取帮助信息"
+        # 尝试重新查找
+        find_3proxy_path
     fi
 }
 
 # 直接启动3proxy（不使用服务）
 start_proxy_directly() {
-    if [ -z "$PROXY_BIN" ]; then
+    if [ -z "$PROXY_BIN" ] || echo "$PROXY_BIN" | grep -q "init.d"; then
+        echo "重新查找3proxy二进制文件..."
         find_3proxy_path
     fi
     
     if [ -n "$PROXY_BIN" ] && [ -f "$CONFIG_FILE" ]; then
         echo "尝试直接启动3proxy..."
+        echo "使用二进制文件: $PROXY_BIN"
         
         # 停止任何现有的3proxy进程
         pkill -f 3proxy 2>/dev/null
@@ -536,6 +570,12 @@ restart_proxy() {
     # 先尝试停止所有3proxy进程
     pkill -f 3proxy 2>/dev/null
     sleep 1
+    
+    # 确保我们有正确的二进制文件
+    if [ -z "$PROXY_BIN" ] || echo "$PROXY_BIN" | grep -q "init.d"; then
+        echo "重新查找3proxy二进制文件..."
+        find_3proxy_path
+    fi
     
     # 尝试启动服务
     echo "尝试通过服务启动3proxy..."
@@ -666,36 +706,69 @@ configure_firewall() {
 try_all_startup_methods() {
     echo "尝试所有可能的3proxy启动方法..."
     
-    # 获取参数
-    local port=$1
-    local username=$2
-    local password=$3
-    
-    # 如果未提供参数，从配置获取
-    if [ -z "$port" ] || [ -z "$username" ] || [ -z "$password" ]; then
-        port=$(grep "端口:" "$CONFIG_INFO" 2>/dev/null | awk '{print $2}')
-        username=$(grep "用户名:" "$CONFIG_INFO" 2>/dev/null | awk '{print $2}')
-        password=$(grep "密码:" "$CONFIG_INFO" 2>/dev/null | awk '{print $2}')
+    # 首先确保我们有正确的3proxy二进制文件
+    if [ -z "$PROXY_BIN" ] || echo "$PROXY_BIN" | grep -q "init.d"; then
+        PROXY_BIN=""
+        echo "重新查找3proxy二进制文件..."
         
-        # 如果仍然为空，使用随机值
-        if [ -z "$port" ]; then port=$(generate_random_port); fi
-        if [ -z "$username" ]; then username=$(generate_random_string 8); fi
-        if [ -z "$password" ]; then password=$(generate_random_string 12); fi
+        # 手动搜索可能的位置
+        for binary in "/usr/bin/3proxy" "/usr/sbin/3proxy" "/usr/local/bin/3proxy" "/usr/local/sbin/3proxy"; do
+            if [ -x "$binary" ] && ! echo "$binary" | grep -q "init.d"; then
+                file_type=$(file -b "$binary" 2>/dev/null)
+                if echo "$file_type" | grep -q "ELF" || echo "$file_type" | grep -q "executable"; then
+                    PROXY_BIN="$binary"
+                    echo "找到二进制文件: $PROXY_BIN"
+                    break
+                fi
+            fi
+        done
+        
+        # 如果还是找不到，尝试从包管理器获取
+        if [ -z "$PROXY_BIN" ]; then
+            echo "尝试从安装包获取3proxy位置..."
+            pkg_file=$(apk info -L 3proxy 2>/dev/null | grep "bin/3proxy$" | head -n 1)
+            if [ -n "$pkg_file" ] && [ -x "$pkg_file" ] && ! echo "$pkg_file" | grep -q "init.d"; then
+                PROXY_BIN="$pkg_file"
+                echo "从包找到3proxy: $PROXY_BIN"
+            fi
+        fi
+        
+        # 如果仍然没有找到，尝试手动安装3proxy
+        if [ -z "$PROXY_BIN" ]; then
+            echo "尝试安装/重新安装3proxy..."
+            apk del 3proxy
+            apk add 3proxy
+            
+            # 再次查找
+            for binary in "/usr/bin/3proxy" "/usr/sbin/3proxy"; do
+                if [ -x "$binary" ] && ! echo "$binary" | grep -q "init.d"; then
+                    PROXY_BIN="$binary"
+                    echo "重新安装后找到: $PROXY_BIN"
+                    break
+                fi
+            done
+        fi
     fi
+    
+    # 如果仍然没有找到，退出
+    if [ -z "$PROXY_BIN" ]; then
+        echo "错误: 无法找到有效的3proxy二进制文件，请手动安装并确保正确配置PATH"
+        return 1
+    fi
+    
+    # 获取当前配置或使用默认配置
+    local port=$(grep "端口:" "$CONFIG_INFO" 2>/dev/null | awk '{print $2}')
+    local username=$(grep "用户名:" "$CONFIG_INFO" 2>/dev/null | awk '{print $2}')
+    local password=$(grep "密码:" "$CONFIG_INFO" 2>/dev/null | awk '{print $2}')
+    
+    # 如果仍然为空，使用随机值
+    if [ -z "$port" ]; then port=$(generate_random_port); fi
+    if [ -z "$username" ]; then username=$(generate_random_string 8); fi
+    if [ -z "$password" ]; then password=$(generate_random_string 12); fi
     
     # 停止任何现有的3proxy进程
     pkill -f 3proxy 2>/dev/null
     sleep 1
-    
-    # 查找3proxy可执行文件
-    if [ -z "$PROXY_BIN" ]; then
-        find_3proxy_path
-    fi
-    
-    if [ -z "$PROXY_BIN" ]; then
-        echo "错误: 找不到3proxy可执行文件"
-        return 1
-    fi
     
     echo "准备使用以下参数尝试启动3proxy:"
     echo "二进制文件: $PROXY_BIN"
@@ -724,18 +797,8 @@ EOF
         return 0
     fi
     
-    # 方法2: 使用命令行参数
-    echo "尝试方法2: 使用命令行参数"
-    $PROXY_BIN "auth strong" "users $username:CL:$password" "allow $username" "socks -p$port" &
-    sleep 2
-    
-    if pgrep -f 3proxy >/dev/null; then
-        echo "方法2成功!"
-        return 0
-    fi
-    
-    # 方法3: 最简单的配置
-    echo "尝试方法3: 最简单的配置"
+    # 方法2: 最简单的配置
+    echo "尝试方法2: 最简单的配置"
     local simple_config="/tmp/3proxy.simple.cfg"
     echo "socks -p$port" > "$simple_config"
     cd /tmp
@@ -743,128 +806,158 @@ EOF
     sleep 2
     
     if pgrep -f 3proxy >/dev/null; then
-        echo "方法3成功!"
-        # 更新配置信息 (但不保存简单配置，因为没有验证)
+        echo "方法2成功!"
+        # 更新配置信息
         echo "注意: 使用了简单配置，没有用户验证"
         return 0
     fi
     
-    # 方法4: 不带参数直接运行
-    echo "尝试方法4: 不带参数直接运行"
+    # 方法3: 不带参数直接运行
+    echo "尝试方法3: 不带参数直接运行"
     cd /etc/3proxy
     $PROXY_BIN &
     sleep 2
     
     if pgrep -f 3proxy >/dev/null; then
+        echo "方法3成功!"
+        return 0
+    fi
+    
+    # 方法4: 测试是否是其他命令格式
+    echo "尝试方法4: 使用命令行格式"
+    cd /tmp
+    $PROXY_BIN "socks" "-p$port" &
+    sleep 2
+    
+    if pgrep -f 3proxy >/dev/null; then
         echo "方法4成功!"
-        # 更新配置信息
         return 0
     fi
     
     echo "所有启动方法均失败!"
+    echo "3proxy帮助信息:"
+    $PROXY_BIN -h 2>&1 || $PROXY_BIN --help 2>&1 || $PROXY_BIN 2>&1
     return 1
 }
 
-# 主菜单
-show_menu() {
-    # 如果是通过管道执行，直接自动安装
-    if is_pipe_execution; then
-        auto_install
-        exit 0
+# 手动安装3proxy
+manual_install_3proxy() {
+    echo "尝试手动安装3proxy..."
+    
+    # 停止现有服务
+    rc-service 3proxy stop 2>/dev/null
+    pkill -f 3proxy 2>/dev/null
+    
+    # 卸载现有包
+    apk del 3proxy
+    
+    # 安装编译工具
+    apk add gcc make musl-dev wget
+    
+    # 创建临时目录
+    mkdir -p /tmp/3proxy_install
+    cd /tmp/3proxy_install
+    
+    # 下载3proxy
+    wget https://<think>这个错误信息非常明确，表明脚本找到的所谓"3proxy"二进制文件实际上是 `/etc/init.d/3proxy` 服务控制脚本，而不是真正的3proxy可执行文件。
+
+问题分析：
+1. `/etc/init.d/3proxy` 是OpenRC的服务启动脚本，不是3proxy程序本身
+2. 错误 "unknown function" 和显示的帮助输出都是OpenRC服务脚本的特征
+3. `find_3proxy_path` 函数没有正确识别出真正的3proxy可执行文件
+
+需要修复的问题：
+1. 改进 `is_real_3proxy_binary` 函数，更准确地区分服务脚本和真正的3proxy二进制文件
+2. 添加更严格的检测机制，确保找到的是真正的3proxy二进制文件
+3. 如果无法找到真正的3proxy，提供明确的报错信息</think>
+
+问题在于脚本找到的 "3proxy" 可执行文件实际上是服务控制脚本 (`/etc/init.d/3proxy`)，而不是真正的3proxy二进制程序。
+
+这里有一个修复后的脚本片段，专注于改进3proxy二进制文件的检测部分：
+
+```bash
+# 检查文件是否为真正的3proxy可执行文件（不是服务脚本）
+is_real_3proxy_binary() {
+    file_path="$1"
+    
+    # 检查文件是否存在且可执行
+    if [ ! -f "$file_path" ] || [ ! -x "$file_path" ]; then
+        return 1
     fi
-
-    clear
-    echo "===== Alpine Socks5代理配置工具 ====="
-    echo "1. 配置随机端口和凭据的代理"
-    echo "2. 配置自定义端口和凭据的代理"
-    echo "3. 重启代理服务"
-    echo "4. 查看当前代理配置"
-    echo "5. 检查/重启保活功能"
-    echo "6. 手动启动代理（不使用服务）"
-    echo "7. 检查服务日志"
-    echo "8. 尝试所有启动方法(紧急修复)"
-    echo "0. 退出"
-    echo "=============================="
-    echo -n "请选择: "
-    read -r choice
     
-    case $choice in
-        1) configure_random_proxy ;;
-        2) configure_custom_proxy ;;
-        3) restart_proxy ;;
-        4) view_proxy_info ;;
-        5) setup_keepalive && echo "保活功能已重新配置" ;;
-        6) start_proxy_directly ;;
-        7) check_log_for_errors ;;
-        8) try_all_startup_methods ;;
-        0) exit 0 ;;
-        *) echo "无效选择，请重试。" ;;
-    esac
-    
-    if ! is_pipe_execution; then
-        echo ""
-        echo "按Enter键继续..."
-        read -r
-        show_menu
+    # 排除init.d脚本
+    if echo "$file_path" | grep -q "/etc/init.d"; then
+        return 1
     fi
-}
-
-# 自动安装函数
-auto_install() {
-    echo "正在执行自动安装..."
-    install_required_software
-    get_public_ip
-    create_service_script
-    setup_keepalive
-    configure_random_proxy
-    configure_firewall
-    echo "安装完成! 代理信息如下:"
-    view_proxy_info
-}
-
-# 主程序入口
-main() {
-    # 首先确保安装所需软件 - 移到最前面执行
-    install_required_software
     
-    # 获取公网IP
-    get_public_ip
+    # 检查文件类型
+    file_type=$(file -b "$file_path" 2>/dev/null)
     
-    # 创建服务启动脚本
-    create_service_script
+    # 如果是shell脚本，直接排除
+    if echo "$file_type" | grep -q "shell script"; then
+        return 1
+    fi
     
-    # 设置保活功能
-    setup_keepalive
-    
-    # 检查是否有现有配置
-    if [ -f "$CONFIG_FILE" ]; then
-        echo "检测到现有配置，正在启动服务..."
-        restart_proxy
-        configure_firewall
-        view_proxy_info
-        if [ ! is_pipe_execution ] && [ "$1" != "--auto" ]; then
-            echo "按Enter键继续..."
-            read -r
+    # 检查是否为ELF二进制文件
+    if echo "$file_type" | grep -q "ELF" || echo "$file_type" | grep -q "executable"; then
+        # 尝试执行带-v参数，验证是否真正的3proxy
+        if "$file_path" -v 2>&1 | grep -q "3proxy version"; then
+            return 0
+        fi
+        
+        # 如果-v不能用，尝试无参数运行，看输出是否包含3proxy相关信息
+        if "$file_path" 2>&1 | grep -q -i "3proxy"; then
+            # 排除服务脚本输出
+            if ! "$file_path" 2>&1 | grep -q "Usage: 3proxy 
+$$
+options
+$$
+ stop"; then
+                return 0
+            fi
         fi
     fi
     
-    # 检查命令行参数
-    if [ "$1" = "--auto" ]; then
-        if [ ! -f "$CONFIG_FILE" ]; then
-            auto_install
-        fi
-        exit 0
-    fi
-    
-    # 检查是否通过管道执行
-    if is_pipe_execution; then
-        auto_install
-        exit 0
-    fi
-    
-    # 显示主菜单
-    show_menu
+    # 默认假设不是真正的3proxy
+    return 1
 }
 
-# 执行主程序
-main "$@"
+# 修改查找3proxy路径函数
+find_3proxy_path() {
+    echo "正在检测3proxy安装路径..."
+    PROXY_BIN=""  # 重置变量
+    
+    # 使用which查找
+    which_path=$(which 3proxy 2>/dev/null)
+    if [ -n "$which_path" ] && is_real_3proxy_binary "$which_path"; then
+        PROXY_BIN="$which_path"
+        echo "找到3proxy可执行文件: $PROXY_BIN"
+        return 0
+    fi
+    
+    # 在常见位置查找
+    for path in "/usr/bin/3proxy" "/usr/sbin/3proxy" "/usr/local/bin/3proxy" "/usr/local/sbin/3proxy"; do
+        if [ -x "$path" ] && is_real_3proxy_binary "$path"; then
+            PROXY_BIN="$path"
+            echo "找到3proxy可执行文件: $PROXY_BIN"
+            return 0
+        fi
+    done
+    
+    # 如果找不到，重新安装3proxy
+    echo "未找到真正的3proxy二进制文件，尝试重新安装..."
+    apk del 3proxy 2>/dev/null
+    apk add 3proxy
+    
+    # 再次检查安装
+    for path in "/usr/bin/3proxy" "/usr/sbin/3proxy"; do
+        if [ -x "$path" ] && is_real_3proxy_binary "$path"; then
+            PROXY_BIN="$path"
+            echo "重新安装后找到3proxy: $PROXY_BIN"
+            return 0
+        fi
+    done
+    
+    echo "错误: 无法找到有效的3proxy二进制文件。"
+    return 1
+}
